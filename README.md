@@ -91,7 +91,7 @@ This service processes CSV files uploaded to an S3 bucket, parses the data using
    - Environment variables (`TABLE_NAME` and `TOPIC_ARN`) are set automatically via the template.
 4. **Testing**:
    - Upload a test CSV file to the S3 bucket named `music-festival-lineup`.
-   - Verify that:
+   - Result:
      - Data is stored correctly in the DynamoDB table `music-festival-table`.
      - A notification is received via SNS indicating success or failure.
 
