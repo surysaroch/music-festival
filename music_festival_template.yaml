@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Music Festival Lineup Infrastructure
+
+Resources:
+
+  # S3 Bucket to store CSV files and trigger Lambda on new uploads
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - LambdaFunction
+      - LambdaInvokePermission
+    Properties:
+      BucketName: music-festival-lineup
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'  # Trigger on new object creation
+            Function: !GetAtt LambdaFunction.Arn  # Invoke this Lambda function
+
+  # DynamoDB Table to store performance data
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: music-festival-table
+      AttributeDefinitions:
+        # Define attributes used in keys and indexes
+        - AttributeName: Performer
+          AttributeType: S  # String type
+        - AttributeName: DateStartTime
+          AttributeType: S
+        - AttributeName: Stage
+          AttributeType: S
+        - AttributeName: Date
+          AttributeType: S
+        - AttributeName: StartTime
+          AttributeType: S
+      KeySchema:
+        # Primary key: Performer (partition key), DateStartTime (sort key)
+        - AttributeName: Performer
+          KeyType: HASH
+        - AttributeName: DateStartTime
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # Index to query performances by Stage and DateStartTime
+        - IndexName: StageIndex
+          KeySchema:
+            - AttributeName: Stage
+              KeyType: HASH
+            - AttributeName: DateStartTime
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL  # Include all attributes in query results
+        # Index to query performances by Date and StartTime
+        - IndexName: DateIndex
+          KeySchema:
+            - AttributeName: Date
+              KeyType: HASH
+            - AttributeName: StartTime
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST  # On-demand billing for cost efficiency
+
+  # SNS Topic for notifications from Lambda function
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: Music-Festival-Setup-SNS
+
+  # IAM Role for Lambda Function with necessary permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaMusicFestivalRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow Lambda service to assume this role
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaMusicFestivalPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Permission to read objects from the S3 bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub '${S3Bucket.Arn}/*'
+              # Permission to write items to the DynamoDB table
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt DynamoDBTable.Arn
+              # Permission to publish messages to the SNS topic
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopic
+
+  # Lambda Function to process CSV files and store data in DynamoDB
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessMusicFestivalCSV
+      Runtime: python3.10
+      Handler: lambda_function.lambda_handler  # Specifies the entry point
+      Role: !GetAtt LambdaExecutionRole.Arn  # IAM role with necessary permissions
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTable  # DynamoDB table name from the stack
+          TOPIC_ARN: !Ref SNSTopic        # SNS topic ARN from the stack
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import os
+          import io
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              dynamodb = boto3.resource('dynamodb')
+              sns = boto3.client('sns')
+
+              # Extract bucket name and object key from the event
+              bucket_name = event['Records'][0]['s3']['bucket']['name']
+              object_key = event['Records'][0]['s3']['object']['key']
+
+              # Retrieve environment variables
+              table_name = os.environ['TABLE_NAME']
+              topic_arn = os.environ['TOPIC_ARN']
+
+              try:
+                  # Get the CSV file from S3
+                  response = s3.get_object(Bucket=bucket_name, Key=object_key)
+                  content = response['Body'].read().decode('utf-8')
+
+                  # Parse CSV content
+                  csv_file = io.StringIO(content)
+                  reader = csv.DictReader(csv_file)
+
+                  # Reference the DynamoDB table
+                  table = dynamodb.Table(table_name)
+
+                  # Batch write to DynamoDB
+                  with table.batch_writer() as batch:
+                      for row in reader:
+                          performer = row['Performer']
+                          stage = row['Stage']
+                          date = row['Date']
+                          start_time = row['Start']
+                          end_time = row['End']
+                          date_start_time = f"{date}#{start_time}"
+
+                          item = {
+                              'Performer': performer,
+                              'DateStartTime': date_start_time,
+                              'Stage': stage,
+                              'Date': date,
+                              'StartTime': start_time,
+                              'EndTime': end_time,
+                          }
+                          batch.put_item(Item=item)
+
+                  # Send success notification
+                  message = f"Successfully processed file '{object_key}' and inserted records into DynamoDB."
+                  sns.publish(TopicArn=topic_arn, Message=message, Subject='Lambda Execution Successful')
+
+              except Exception as e:
+                  # Send failure notification
+                  message = f"Error processing file '{object_key}': {str(e)}"
+                  sns.publish(TopicArn=topic_arn, Message=message, Subject='Lambda Execution Failed')
+                  raise e
+
+  # Permission for S3 to invoke the Lambda function on new object creation
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt S3Bucket.Arn  # Limit invocation to this bucket
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref S3Bucket
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref DynamoDBTable
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunction
+
+  SNSTopicName:
+    Description: Name of the SNS topic
+    Value: !Ref SNSTopic
